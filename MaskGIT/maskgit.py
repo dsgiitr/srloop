@@ -13,7 +13,10 @@ class MaskGIT(nn.Module):
         self.criterion = nn.CrossEntropyLoss(reduction='none')
 
     def cosine_schedule(self, t):
-        return math.cos((math.pi / 2) * t)
+        if isinstance(t, torch.Tensor):
+            return torch.cos((math.pi / 2) * t)
+        else:
+            return math.cos((math.pi / 2) * t)
 
     def forward_step(self, images):
         B, C, H, W = images.shape
@@ -40,7 +43,7 @@ class MaskGIT(nn.Module):
         return masked_loss
 
     @torch.no_grad()
-    def deploy(self, num_samples, T=10, device='cpu'):
+    def deploy(self, num_samples, T=10, device='cuda'):
         self.eval()
         B, C, H, W = num_samples, 3, self.img_size, self.img_size
         
@@ -57,11 +60,13 @@ class MaskGIT(nn.Module):
             features = self.base_model(unet_input)
             logits = self.mlm_layer(features)
             
-            probs = F.softmax(logits, dim=2)
-            max_probs, preds = torch.max(probs, dim=2) 
+            probs = F.softmax(logits, dim=1)
+            probs_reshaped = probs.permute(0, 2, 3, 4, 1)
+            preds = torch.distributions.Categorical(probs_reshaped).sample()
             
             current_img = torch.where(bool_mask.expand(-1, 3, -1, -1), preds, current_img)
-            avg_confidence = max_probs.mean(dim=1, keepdim=True) 
+            sampled_probs = torch.gather(probs, dim=1, index=preds.unsqueeze(1)).squeeze(1)
+            avg_confidence = sampled_probs.mean(dim=1, keepdim=True)
             
             avg_confidence[~bool_mask] = 100.0 
             flat_conf = avg_confidence.view(B, -1)

@@ -11,5 +11,5 @@ class MLMLayer(nn.Module):
     def forward(self, x):
         B, _, H, W = x.shape
         logits = self.conv_out(x)
-        logits = logits.view(B, self.colour_channels, self.num_classes, H, W)
+        logits = logits.view(B, self.num_classes, self.colour_channels, H, W)
         return logits

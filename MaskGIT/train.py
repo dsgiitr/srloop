@@ -8,8 +8,8 @@ from maskgit import MaskGIT
 
 def train_maskgit():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    unet = Unet(in_channels=4, hidden_dims=[64, 128, 256])
-    mlm = MLMLayer(in_channels=64, num_classes=256, color_channels=3)
+    unet = Unet(in_channels=4)
+    mlm = MLMLayer(in_channels=32, num_classes=256, colour_channels=3)
     maskgit = MaskGIT(base_model=unet, mlm_layer=mlm, img_size=32).to(device)
     
     optimizer = optim.Adam(maskgit.parameters(), lr=1e-3)
