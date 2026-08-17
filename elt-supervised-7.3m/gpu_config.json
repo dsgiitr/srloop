@@ -1,0 +1,6 @@
+{
+  "num_gpus": 2,
+  "use_compile": false,
+  "use_bfloat16": false,
+  "use_amp": true
+}
