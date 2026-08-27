@@ -1,52 +1,93 @@
-import argparse
-import numpy as np
-from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
-
+from torchvision.utils import save_image
+from tqdm import tqdm
+from datasets import load_dataset
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
-import lpips
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
 from config import SRDiffELTConfig
-from data import CIFAR10SRDataset
 from model import ELTSR
 from diffusion import DiffusionSchedule
+from data import HFCelebASRDataset
+from ema import EMA
 
-@torch.no_grad()
-def run_evaluation(checkpoint_path: str, eval_L: int):
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+def evaluate_model(checkpoint_path, num_batches=20):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- Starting Inference on {device} ---")
+
+    # 1. Initialize Architecture
     config = SRDiffELTConfig()
+    base_model = ELTSR(config).to(device)
+    ema = EMA(base_model, decay=config.ema_decay).to(device)
 
-    model = ELTSR(config).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt.get("ema_state_dict", ckpt.get("model_state_dict", ckpt)))
+    # 2. Load Weights
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    if "ema_state_dict" in checkpoint:
+        ema.load_state_dict(checkpoint["ema_state_dict"])
+        model = ema.ema_model
+        print("Successfully loaded EMA weights (Highest Quality).")
+    else:
+        base_model.load_state_dict(checkpoint["model_state_dict"])
+        model = base_model
+        print("Loaded standard model weights.")
+    
     model.eval()
-
     schedule = DiffusionSchedule(timesteps=config.num_timesteps)
+
+    # 3. Prepare Dataset (Test Split)
+    print("Fetching CelebA validation set...")
+    raw_dataset = load_dataset("nielsr/CelebA-faces", split="train")
+    split_dataset = raw_dataset.train_test_split(test_size=0.1, seed=42)
+    val_subset = split_dataset["test"].select(range(5000))
+    val_data = HFCelebASRDataset(val_subset, img_size=config.img_size)
+
+    val_loader = DataLoader(val_data, batch_size=16, shuffle=False, num_workers=2)
+
+    # 4. Initialize Metrics (Standardized to [0, 1] range)
     psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    lpips_metric = lpips.LPIPS(net="alex").to(device)
+    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type='vgg', normalize=True).to(device)
 
-    dataset = CIFAR10SRDataset(root=config.data_dir, train=False, download=False)
-    loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=2)
+    total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
 
-    psnr_list, ssim_list, lpips_list = [], [], []
+    print(f"\nEvaluating {num_batches} batches...")
+    with torch.no_grad():
+        for i, batch in enumerate(tqdm(val_loader, total=num_batches)):
+            if i >= num_batches:
+                break
 
-    print(f"\n--- Running Evaluation: Loop Count L={eval_L} ---")
-    for batch in tqdm(loader, desc="Evaluating Test Set"):
-        i_lq, i_base, i_hq = batch["i_lq"].to(device), batch["i_base"].to(device), batch["i_hq"].to(device)
-        pred_res = schedule.sample_sr(model, i_base, i_lq, i_hq.shape, device, num_loops=eval_L)
-        sr_01 = (torch.clamp(i_base + pred_res, -1.0, 1.0) + 1.0) / 2.0
-        hq_01 = (i_hq + 1.0) / 2.0
+            v_lq = batch["i_lq"].to(device)
+            v_base = batch["i_base"].to(device)
+            v_hq = batch["i_hq"].to(device)
 
-        psnr_list.append(psnr_metric(sr_01, hq_01).item())
-        ssim_list.append(ssim_metric(sr_01, hq_01).item())
-        lpips_list.append(lpips_metric(sr_01 * 2 - 1, i_hq).mean().item())
+            # Iterative Denoising / Upscaling
+            pred_res = schedule.sample_sr(model, v_base, v_lq, v_hq.shape, device, num_loops=config.max_loops)
+            pred_hq = torch.clamp(v_base + pred_res, -1.0, 1.0)
 
-    print(f" PSNR: {np.mean(psnr_list):.2f} dB | SSIM: {np.mean(ssim_list):.4f} | LPIPS: {np.mean(lpips_list):.4f}")
+            # Convert from [-1, 1] to [0, 1] for metrics calculation
+            pred_hq_01 = torch.clamp((pred_hq + 1.0) / 2.0, 0.0, 1.0)
+            v_hq_01 = torch.clamp((v_hq + 1.0) / 2.0, 0.0, 1.0)
+            v_base_01 = torch.clamp((v_base + 1.0) / 2.0, 0.0, 1.0)
+
+            # Compute batch metrics
+            total_psnr += psnr_metric(pred_hq_01, v_hq_01).item()
+            total_ssim += ssim_metric(pred_hq_01, v_hq_01).item()
+            total_lpips += lpips_metric(pred_hq_01, v_hq_01).item()
+
+            if i == 0:
+                grid = torch.cat([v_base_01, pred_hq_01, v_hq_01], dim=0)
+                save_image(grid, "final_eval_grid.png", nrow=16)
+
+    # 5. Final Results
+    print("\n=== Final Evaluation Metrics ===")
+    print(f"PSNR:  {total_psnr / num_batches:.4f}")
+    print(f"SSIM:  {total_ssim / num_batches:.4f}")
+    print(f"LPIPS: {total_lpips / num_batches:.4f}")
+    print("Saved 'final_eval_grid.png' to the working directory.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--L", type=int, default=3)
-    args = parser.parse_args()
-    run_evaluation(args.checkpoint, args.L)
+    MODEL_PATH = "/kaggle/input/models/wibwivbiuefhwoiefc/srdiff-celeba/pytorch/default/1/srdiff_elt_celeba_epoch_500.pt"
+    evaluate_model(MODEL_PATH, num_batches=20)

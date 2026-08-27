@@ -1,54 +1,37 @@
-import os
 import torch
-import torch.nn.functional as F
-import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-import torchvision
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from datasets import load_dataset
 
-class CIFAR10SRDataset(torchvision.datasets.CIFAR10):
-    def __init__(self, root: str, train: bool = True, download: bool = False):
-        transform = transforms.Compose([
+class HFCelebASRDataset(Dataset):
+    def __init__(self, hf_data, img_size=32):
+        self.dataset = hf_data
+        self.transform_hq = transforms.Compose([
+            transforms.CenterCrop(140),
+            transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
-        super().__init__(root, train=train, transform=transform, download=download)
+        self.transform_lq = transforms.Resize((img_size // 2, img_size // 2), interpolation=transforms.InterpolationMode.BICUBIC)
+        self.transform_base = transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC)
 
-    def __getitem__(self, index: int) -> dict:
-        hr_img, _ = super().__getitem__(index)
-        lr_img = F.interpolate(hr_img.unsqueeze(0), size=(16, 16), mode="bicubic", align_corners=False).squeeze(0)
-        up_lr_img = F.interpolate(lr_img.unsqueeze(0), size=(32, 32), mode="bicubic", align_corners=False).squeeze(0)
-        residual = hr_img - up_lr_img
+    def __len__(self): 
+        return len(self.dataset)
 
-        return {
-            "i_hq": hr_img,
-            "i_lq": lr_img,
-            "i_base": up_lr_img,
-            "residual": residual
-        }
+    def __getitem__(self, idx):
+        img = self.dataset[idx]["image"].convert("RGB")
+        i_hq = self.transform_hq(img)
+        i_lq = self.transform_lq(i_hq)
+        i_base = self.transform_base(i_lq)
+        return {"i_hq": i_hq, "i_lq": i_lq, "i_base": i_base, "residual": i_hq - i_base}
 
-def create_dataloaders(config, rank: int = 0, world_size: int = 1):
-    if world_size > 1:
-        if rank == 0:
-            torchvision.datasets.CIFAR10(root=config.data_dir, train=True, download=False)
-            torchvision.datasets.CIFAR10(root=config.data_dir, train=False, download=False)
-        dist.barrier()
+def create_dataloaders(config, rank=0, world_size=1):
+    raw_dataset = load_dataset("nielsr/CelebA-faces", split="train")
+    split_dataset = raw_dataset.train_test_split(test_size=0.1, seed=42)
     
-    train_dataset = CIFAR10SRDataset(root=config.data_dir, train=True, download=False)
-    val_dataset = CIFAR10SRDataset(root=config.data_dir, train=False, download=False)
-
-    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=(sampler is None),
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True
-    )
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=2, pin_memory=True)
-
-    return train_loader, val_loader, sampler
+    val_subset = split_dataset["test"].select(range(5000))
+    val_data = HFCelebASRDataset(val_subset, img_size=config.img_size)
+    
+    # We only need the validation loader for inference
+    val_loader = DataLoader(val_data, batch_size=config.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    return None, val_loader, None

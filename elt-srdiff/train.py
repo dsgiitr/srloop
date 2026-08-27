@@ -1,7 +1,7 @@
 import os
-import numpy as np
-from tqdm import tqdm
 import torch
+import torch.nn.functional as F
+from tqdm import tqdm
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision.utils import save_image
@@ -9,7 +9,7 @@ from torchvision.utils import save_image
 from config import SRDiffELTConfig
 from data import create_dataloaders
 from model import ELTSR
-from diffusion import DiffusionSchedule, compute_ilsd_loss
+from diffusion import DiffusionSchedule
 from ema import EMA
 
 def train():
@@ -29,7 +29,6 @@ def train():
     config = SRDiffELTConfig()
 
     train_loader, val_loader, sampler = create_dataloaders(config, rank=rank, world_size=world_size)
-
     model = ELTSR(config).to(device)
     ema = EMA(model, decay=config.ema_decay).to(device)
 
@@ -38,13 +37,10 @@ def train():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     schedule = DiffusionSchedule(timesteps=config.num_timesteps)
-
-    total_steps = len(train_loader) * config.epochs
-    global_step = 0
     model.train()
 
     if rank == 0:
-        print(f"--- Initializing ELT-SRDiff Training ---")
+        print(f"--- Initializing ELT-SRDiff Training (FAST MODE) ---")
 
     for epoch in range(config.epochs):
         if sampler:
@@ -62,26 +58,18 @@ def train():
             t = torch.randint(0, config.num_timesteps, (residual.shape[0],), device=device).long()
             x_t, noise = schedule.q_sample(residual, t)
 
-            L_int = np.random.randint(config.min_loops, config.max_loops)
-            lam = max(0.0, 1.0 - (global_step / float(total_steps)))
-
             dit = model.module if is_distributed else model
-            out = dit(x_t, i_base, i_lq, t, l_int=L_int)
+            out = dit(x_t, i_base, i_lq, t, l_int=None)
 
-            losses = compute_ilsd_loss(out["eps_teacher"], out["eps_student"], noise, t, config.num_timesteps, lam)
-            losses["loss_total"].backward()
+            loss = F.l1_loss(out["eps_teacher"], noise)
+            loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             ema.update(dit)
-            global_step += 1
 
             if rank == 0:
-                pbar.set_postfix({
-                    "loss": f"{losses['loss_total'].item():.4f}",
-                    "L1_tea": f"{losses['loss_gt_teacher'].item():.4f}",
-                    "lam": f"{lam:.2f}"
-                })
+                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         if rank == 0 and (epoch + 1) % config.eval_freq == 0:
             ckpt_path = f"srdiff_elt_epoch_{epoch+1}.pt"

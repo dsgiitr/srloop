@@ -20,8 +20,8 @@ class DiffusionSchedule:
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor):
         noise = torch.randn_like(x_start)
-        s_ac = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1).to(x_start.device)
-        s_omac = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1).to(x_start.device)
+        s_ac = self.sqrt_alphas_cumprod[t.cpu()].view(-1, 1, 1, 1).to(x_start.device)
+        s_omac = self.sqrt_one_minus_alphas_cumprod[t.cpu()].view(-1, 1, 1, 1).to(x_start.device)
         return s_ac * x_start + s_omac * noise, noise
 
     @torch.no_grad()
